@@ -2,6 +2,8 @@
 
 Move files between your phone and computer by scanning a QR code. No Bluetooth, no AirDrop, no app install, no cloud upload. Files travel **directly between the two devices** over your local Wi‑Fi via WebRTC.
 
+**Hosted app:** https://jidiotspam-hue.github.io/qr-file-transfer/
+
 ```bash
 npm install
 node server.js
@@ -13,11 +15,13 @@ Open the printed LAN URL on your computer, scan the QR with your phone's camera,
 
 | Layer | What it does |
 |---|---|
-| **Signaling** | Express + `ws`. Relays only WebRTC SDP/ICE metadata between the two devices. |
+| **Signaling** | PeerJS Cloud on the hosted app; Express + `ws` remains available for local-only use. Only WebRTC SDP/ICE metadata is relayed. |
 | **Transport** | `RTCDataChannel`, peer‑to‑peer. **File bytes never touch the server.** |
-| **Pairing** | The QR encodes `http://<lan-ip>:<port>/s/<random-uuid>`. Scanning it joins that session. |
+| **Pairing** | The QR encodes the hosted page plus a random, short-lived PeerJS ID. Scanning it joins that browser session. |
 
-Because both devices are on the same LAN, a public STUN server is enough — no TURN relay and no public hosting required.
+The browsers establish a direct connection with public STUN discovery. There is no TURN relay, so particularly restrictive networks may prevent a connection.
+
+The GitHub Pages version uses the public PeerJS broker for pairing metadata. File bytes still travel directly between the two browsers over the encrypted WebRTC data channel and are not uploaded to GitHub or PeerJS.
 
 ## Features
 

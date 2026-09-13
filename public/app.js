@@ -41,10 +41,11 @@
     HIGH_WATER = 8 * 1024 * 1024;
   }
 
-  const isPeer = /^\/s\/[^/]+$/.test(location.pathname);
+  const hostPeerId = new URLSearchParams(location.search).get('peer');
+  const isPeer = Boolean(hostPeerId);
   const role = isPeer ? 'peer' : 'host';
 
-  let ws, pc, channel;
+  let peer, peerConnection, pc, channel;
   let chunkSize = DEFAULT_CHUNK;
   let sending = false;
   const queue = [];
@@ -450,17 +451,11 @@
     });
   }
 
-  function newPeerConnection() {
-    if (pc) { try { pc.close(); } catch {} }
-    pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-
-    pc.addEventListener('icecandidate', (e) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ice', candidate: e.candidate }));
-    });
-
+  function watchPeerConnection(nativePc) {
+    pc = nativePc;
     pc.addEventListener('connectionstatechange', () => {
-      if (!pc) return; // torn down deliberately (peer-left) — ignore trailing events
-      const s = pc.connectionState;
+      if (pc !== nativePc) return;
+      const s = nativePc.connectionState;
       if (s === 'connected') setStatus('Connected', 'live');
       else if (s === 'connecting') setStatus('Linking…');
       else if (s === 'failed') {
@@ -473,60 +468,48 @@
       }
       else if (s === 'disconnected') setStatus('Reconnecting…');
     });
-
-    pc.addEventListener('datachannel', (e) => setupChannel(e.channel));
-    return pc;
   }
 
   // --- Signaling ----------------------------------------------------------
-  function connectSignaling(sessionId, token) {
-    ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws?session=${sessionId}&role=${role}&token=${token}`);
+  function attachPeerConnection(conn) {
+    peerConnection = conn;
+    setStatus('Pairing…');
+    setState('connecting');
 
-    ws.addEventListener('message', async (e) => {
-      const msg = JSON.parse(e.data);
+    conn.on('open', () => {
+      watchPeerConnection(conn.peerConnection);
+      setupChannel(conn.dataChannel);
+    });
 
-      if (msg.type === 'peer-joined') {
-        setStatus('Pairing…');
-        // The QR is meaningless once the phone has joined. Safe because the
-        // 'failed' handler below sends the host back to 'waiting'.
-        setState('connecting');
-        newPeerConnection();
-        if (role === 'host') {
-          setupChannel(pc.createDataChannel('files', { ordered: true }));
-          await pc.setLocalDescription(await pc.createOffer());
-          ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription }));
-        }
-      } else if (msg.type === 'offer') {
-        if (!pc) newPeerConnection();
-        await pc.setRemoteDescription(msg.sdp);
-        await pc.setLocalDescription(await pc.createAnswer());
-        ws.send(JSON.stringify({ type: 'answer', sdp: pc.localDescription }));
-      } else if (msg.type === 'answer') {
-        await pc.setRemoteDescription(msg.sdp);
-      } else if (msg.type === 'ice' && msg.candidate) {
-        try { await pc.addIceCandidate(msg.candidate); } catch (err) { console.error(err); }
-      } else if (msg.type === 'peer-left') {
-        // Tear the connection down deliberately, otherwise its own teardown
-        // fires a late 'failed' event that clobbers the status we set here.
-        if (pc) { try { pc.close(); } catch {} pc = null; }
-        channel = null;
-        queue.length = 0;
-        if (role === 'host') {
-          setStatus('Waiting for phone…');
-          setState('waiting');
-          toast('Phone disconnected — scan again to reconnect');
-        } else {
-          // The peer cannot re-initiate on its own, so say so plainly rather
-          // than leaving a drop zone that looks usable but isn't.
-          setStatus('Computer disconnected', 'dead');
-          setState('lost');
-        }
+    conn.on('close', () => {
+      channel = null;
+      queue.length = 0;
+      if (role === 'host') {
+        setStatus('Waiting for phone…');
+        setState('waiting');
+        toast('Phone disconnected — scan again to reconnect');
+      } else {
+        setStatus('Computer disconnected', 'dead');
+        setState('lost');
       }
     });
 
-    ws.addEventListener('close', () => {
-      if (!channel || channel.readyState !== 'open') setStatus('Offline', 'dead');
+    conn.on('error', (err) => {
+      console.error(err);
+      setStatus('Connection failed', 'dead');
+      toast('Could not reach the other device');
+      setState(role === 'host' ? 'waiting' : 'lost');
     });
+  }
+
+  function createPeer() {
+    peer = new Peer(undefined, { debug: 1 });
+    peer.on('error', (err) => {
+      console.error(err);
+      setStatus('Pairing unavailable', 'dead');
+      toast('Could not reach the pairing service');
+    });
+    return peer;
   }
 
   // --- UI wiring ----------------------------------------------------------
@@ -673,26 +656,35 @@
     if (isPeer) {
       setState('connecting');
       setStatus('Connecting…');
-      const token = new URLSearchParams(location.search).get('t');
-      connectSignaling(location.pathname.split('/')[2], token);
+      const guest = createPeer();
+      guest.on('open', () => {
+        attachPeerConnection(guest.connect(hostPeerId, { reliable: true, serialization: 'raw' }));
+      });
     } else {
       setStatus('Waiting for phone…');
-      const { id, token, joinUrl: url } = await (await fetch('/api/session', { method: 'POST' })).json();
-      joinUrl = url;
-      // Client-side QR generation (avoids blocking server on CPU, especially useful on slow networks)
-      try {
-        // Rendered at exactly 2x the 240px CSS box so modules land on whole
-        // device pixels. Colours stay pure black on white in both themes and
-        // must match --qr-plate in style.css: inverted codes decode
-        // unreliably in native camera apps, and that scan is the whole point.
-        const qrDataUrl = await QRCode.toDataURL(url, { width: 480, margin: 1, color: { dark: '#000000', light: '#FFFFFF' } });
-        el.qrImg.src = qrDataUrl;
-      } catch (err) {
-        console.error('QR generation failed:', err);
-        toast('QR generation failed — use link instead');
-      }
-      setState('waiting');
-      connectSignaling(id, token);
+      const host = createPeer();
+      host.on('open', async (id) => {
+        const url = new URL(location.href);
+        url.search = '';
+        url.hash = '';
+        url.searchParams.set('peer', id);
+        joinUrl = url.href;
+        try {
+          const qrDataUrl = await QRCode.toDataURL(joinUrl, { width: 480, margin: 1, color: { dark: '#000000', light: '#FFFFFF' } });
+          el.qrImg.src = qrDataUrl;
+        } catch (err) {
+          console.error('QR generation failed:', err);
+          toast('QR generation failed — use link instead');
+        }
+        setState('waiting');
+      });
+      host.on('connection', (conn) => {
+        if (peerConnection && peerConnection.open) {
+          conn.close();
+          return;
+        }
+        attachPeerConnection(conn);
+      });
     }
   })();
 })();
